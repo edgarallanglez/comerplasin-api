@@ -73,7 +73,7 @@ app.get("/ventas", async (req, reply) => {
         query += " WHERE " + whereClauses.join(" AND ");
     }
 
-    query += " ORDER BY fecha DESC;";
+    query += " ORDER BY fecha DESC, id_movimiento DESC;";
 
     const result = await request.query(query);
     return result.recordset;
