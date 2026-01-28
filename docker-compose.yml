@@ -1,0 +1,39 @@
+services:
+  zerotier:
+    build: ./zerotier
+    container_name: zt
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - zt_data:/var/lib/zerotier-one
+    environment:
+      - ZT_NETWORK_ID=${ZT_NETWORK_ID}
+    ports:
+      - "${API_PORT}:3001"
+
+  api:
+    build: ./api
+    container_name: bridge_api
+    restart: unless-stopped
+    network_mode: "service:zerotier"
+    depends_on:
+      - zerotier
+    environment:
+      - PORT=3001
+      - API_KEY=${API_KEY}
+      - DB_SERVER=${DB_SERVER}
+      - DB_PORT=${DB_PORT}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${DB_NAME}
+      - DB_ENCRYPT=${DB_ENCRYPT}
+
+volumes:
+  zt_data:
+
+
+# curl -H "x-api-key: c0m3rpl4s1n" http://localhost:3001/ventas

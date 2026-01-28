@@ -1,0 +1,8 @@
+{
+  "name": "zt-mssql-bridge",
+  "type": "module",
+  "dependencies": {
+    "fastify": "^4.28.1",
+    "mssql": "^11.0.1"
+  }
+}
