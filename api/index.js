@@ -76,6 +76,51 @@ app.get("/ventas", async (req, reply) => {
     query += " ORDER BY fecha DESC, id_movimiento DESC;";
 
     const result = await request.query(query);
+
+    return result.recordset;
+});
+
+app.get("/cobranza", async (req, reply) => {
+    const conn = await (poolPromise ??= pool.connect());
+    const { startDate, endDate, year, month } = req.query;
+
+    let query = "SELECT TOP 100 * FROM dbo.v_fact_ventas WHERE saldo_pendiente > 0";
+    let whereClauses = ["saldo_pendiente > 0"];
+    const request = conn.request();
+
+    if (startDate && endDate) {
+        whereClauses.push("fecha >= @startDate AND fecha <= @endDate");
+        request.input("startDate", sql.Date, new Date(startDate));
+        request.input("endDate", sql.Date, new Date(endDate));
+        query = "SELECT * FROM dbo.v_fact_ventas WHERE saldo_pendiente > 0";
+    } else if (year) {
+        const y = parseInt(year);
+        let start, end;
+
+        if (month) {
+            const m = parseInt(month) - 1;
+            start = new Date(y, m, 1);
+            end = new Date(y, m + 1, 0);
+        } else {
+            start = new Date(y, 0, 1);
+            end = new Date(y, 11, 31);
+        }
+
+        whereClauses.push("fecha >= @yearStart AND fecha <= @yearEnd");
+        request.input("yearStart", sql.Date, start);
+        request.input("yearEnd", sql.Date, end);
+
+        query = "SELECT * FROM dbo.v_fact_ventas WHERE saldo_pendiente > 0";
+    }
+
+    if (whereClauses.length > 1) {
+        query = query.replace("WHERE saldo_pendiente > 0", "WHERE " + whereClauses.join(" AND "));
+    }
+
+    query += " ORDER BY fecha_vencimiento ASC, saldo_pendiente DESC;";
+
+    const result = await request.query(query);
+
     return result.recordset;
 });
 
