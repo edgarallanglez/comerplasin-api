@@ -32,7 +32,7 @@ app.get("/health", async () => ({ ok: true }));
 // Ejemplo: endpoint fijo (recomendado)
 app.get("/ventas", async (req, reply) => {
     const conn = await (poolPromise ??= pool.connect());
-    const { startDate, endDate, year, month } = req.query;
+    const { startDate, endDate, year, month, cliente } = req.query;
 
     let query = "SELECT TOP 100 * FROM dbo.v_fact_ventas";
     let whereClauses = [];
@@ -52,10 +52,6 @@ app.get("/ventas", async (req, reply) => {
             const m = parseInt(month) - 1; // JS months are 0-11
             start = new Date(y, m, 1);
             end = new Date(y, m + 1, 0); // Last day of month
-            // Set end to end of day? 
-            // If DB is just Date, this is fine. If DateTime, might miss time. 
-            // Safer to just use date boundaries assuming strict Date column or handle time if needed.
-            // For now assuming standard Date usage.
         } else {
             start = new Date(y, 0, 1);
             end = new Date(y, 11, 31);
@@ -69,8 +65,14 @@ app.get("/ventas", async (req, reply) => {
         query = "SELECT * FROM dbo.v_fact_ventas";
     }
 
+    if (cliente) {
+        // Filter by client ID
+        whereClauses.push("id_cliente = @cliente");
+        request.input("cliente", sql.Int, parseInt(cliente));
+    }
+
     if (whereClauses.length > 0) {
-        query += " WHERE " + whereClauses.join(" AND ");
+        query += (query.includes("WHERE") ? " AND " : " WHERE ") + whereClauses.join(" AND ");
     }
 
     query += " ORDER BY fecha DESC, id_movimiento DESC;";
@@ -80,9 +82,29 @@ app.get("/ventas", async (req, reply) => {
     return result.recordset;
 });
 
+app.get("/clientes", async (req, reply) => {
+    const conn = await (poolPromise ??= pool.connect());
+    const { q, type } = req.query;
+    const tipo = type ? parseInt(type) : 1; // 1 = Cliente, 2 = Proveedor
+
+    let query = "SELECT CIDCLIENTEPROVEEDOR as id, CRAZONSOCIAL as nombre FROM dbo.admClientes WHERE CTIPOCLIENTE = @tipo";
+    const request = conn.request();
+    request.input("tipo", sql.Int, tipo);
+
+    if (q) {
+        query += " AND CRAZONSOCIAL LIKE @q";
+        request.input("q", sql.NVarChar, `%${q}%`);
+    }
+
+    query += " ORDER BY CRAZONSOCIAL";
+
+    const result = await request.query(query);
+    return result.recordset;
+});
+
 app.get("/cobranza", async (req, reply) => {
     const conn = await (poolPromise ??= pool.connect());
-    const { startDate, endDate, year, month } = req.query;
+    const { startDate, endDate, year, month, cliente } = req.query;
 
     // Base query with GROUP BY to get distinct id_documento with saldo_pendiente
     // Note: saldo_pendiente is the same for all line items in a document, so we use MAX (not SUM)
@@ -120,6 +142,11 @@ app.get("/cobranza", async (req, reply) => {
         request.input("yearEnd", sql.Date, end);
     }
 
+    if (cliente) {
+        whereClauses.push("id_cliente = @cliente");
+        request.input("cliente", sql.Int, parseInt(cliente));
+    }
+
     let query = selectClause + " WHERE " + whereClauses.join(" AND ");
     query += " GROUP BY id_documento, cliente_name";
     query += " HAVING MAX(saldo_pendiente) > 0";
@@ -136,55 +163,73 @@ app.get("/inventario", async (req, reply) => {
 
     let selectClause = `
         SELECT 
-            id_existencia,
-            id_producto,
-            codigo_producto,
-            nombre_producto,
-            status_producto,
-            id_almacen,
-            codigo_almacen,
-            almacen,
-            existencia,
-            fecha_extraccion
-        FROM dbo.v_inventario_actual
+            e.CIDEXISTENCIA as id_existencia,
+            p.CIDPRODUCTO as id_producto,
+            p.CCODIGOPRODUCTO as codigo_producto,
+            p.CNOMBREPRODUCTO as nombre_producto,
+            p.CSTATUSPRODUCTO as status_producto,
+            a.CIDALMACEN as id_almacen,
+            a.CCODIGOALMACEN as codigo_almacen,
+            a.CNOMBREALMACEN as almacen,
+            (e.CENTRADASPERIODO12 - e.CSALIDASPERIODO12) as existencia,
+            e.CTIMESTAMP as fecha_extraccion,
+            ISNULL(mm.CEXISTENCIAMINBASE, 0) as min_stock,
+            ISNULL(mm.CEXISTENCIAMAXBASE, 0) as max_stock,
+            ISNULL(ch.CULTIMOCOSTOH, 0) as ultimo_costo
+        FROM dbo.admExistenciaCosto e
+        JOIN dbo.admProductos p ON e.CIDPRODUCTO = p.CIDPRODUCTO
+        JOIN dbo.admAlmacenes a ON e.CIDALMACEN = a.CIDALMACEN
+        OUTER APPLY (
+            SELECT TOP 1 CEXISTENCIAMINBASE, CEXISTENCIAMAXBASE
+            FROM dbo.admMaximosMinimos mm
+            WHERE mm.CIDALMACEN = a.CIDALMACEN
+              AND (mm.CIDPRODUCTO = p.CIDPRODUCTO OR mm.CIDPRODUCTOPADRE = p.CIDPRODUCTO)
+        ) mm
+        OUTER APPLY (
+            SELECT TOP 1 CULTIMOCOSTOH 
+            FROM dbo.admCostosHistoricos ch 
+            WHERE ch.CIDPRODUCTO = p.CIDPRODUCTO 
+            ORDER BY ch.CFECHACOSTOH DESC, ch.CIDCOSTOH DESC
+        ) ch
+        WHERE e.CIDEJERCICIO = (SELECT MAX(CIDEJERCICIO) FROM dbo.admExistenciaCosto)
     `;
     let whereClauses = [];
     const request = conn.request();
 
     // Filter by warehouse
     if (almacen) {
-        whereClauses.push("id_almacen = @almacen");
+        whereClauses.push("e.CIDALMACEN = @almacen");
         request.input("almacen", sql.Int, parseInt(almacen));
     }
 
     // Filter by product (search in code or name)
     if (producto) {
-        whereClauses.push("(codigo_producto LIKE @producto OR nombre_producto LIKE @producto)");
+        whereClauses.push("(p.CCODIGOPRODUCTO LIKE @producto OR p.CNOMBREPRODUCTO LIKE @producto)");
         request.input("producto", sql.NVarChar, `%${producto}%`);
     }
 
     // Filter by status (default to active products only)
     if (status) {
-        whereClauses.push("status_producto = @status");
+        whereClauses.push("p.CSTATUSPRODUCTO = @status");
         request.input("status", sql.Int, parseInt(status));
     } else {
         // By default, only show active products
-        whereClauses.push("status_producto = 1");
+        whereClauses.push("p.CSTATUSPRODUCTO = 1");
     }
 
     // Filter by stock range
     if (minStock) {
-        whereClauses.push("existencia > @minStock");
+        whereClauses.push("(e.CENTRADASPERIODO12 - e.CSALIDASPERIODO12) > @minStock");
         request.input("minStock", sql.Decimal, parseFloat(minStock));
     }
     if (maxStock) {
-        whereClauses.push("existencia <= @maxStock");
+        whereClauses.push("(e.CENTRADASPERIODO12 - e.CSALIDASPERIODO12) <= @maxStock");
         request.input("maxStock", sql.Decimal, parseFloat(maxStock));
     }
 
     let query = selectClause;
     if (whereClauses.length > 0) {
-        query += " WHERE " + whereClauses.join(" AND ");
+        query += " AND " + whereClauses.join(" AND ");
     }
     query += " ORDER BY almacen, nombre_producto;";
 
@@ -641,6 +686,65 @@ app.get("/pagos-proveedores", async (req, reply) => {
             ORDER BY CFECHA DESC, CIDDOCUMENTO DESC;
         `;
     }
+
+    const result = await request.query(query);
+    return result.recordset;
+});
+
+app.get("/metas", async (req, reply) => {
+    const conn = await (poolPromise ??= pool.connect());
+    const { year, month } = req.query;
+
+    const currentYear = year ? parseInt(year) : new Date().getFullYear();
+    const currentMonth = month ? parseInt(month) : new Date().getMonth() + 1;
+    const prevYear = currentYear - 1;
+
+    const request = conn.request();
+    request.input("currentYear", sql.Int, currentYear);
+    request.input("prevYear", sql.Int, prevYear);
+    request.input("currentMonth", sql.Int, currentMonth);
+
+    // Using subtotal as value metric
+    const query = `
+        SELECT 
+            c.CIDCLIENTEPROVEEDOR as id_cliente,
+            c.CRAZONSOCIAL as cliente_name,
+            
+            -- Venta Año Anterior
+            ISNULL(SUM(CASE 
+                WHEN YEAR(v.fecha) = @prevYear 
+                THEN v.subtotal ELSE 0 
+            END), 0) as venta_anio_anterior,
+            
+            -- Venta Mes Anterior (Mismo mes del año anterior)
+            ISNULL(SUM(CASE 
+                WHEN YEAR(v.fecha) = @prevYear AND MONTH(v.fecha) = @currentMonth
+                THEN v.subtotal ELSE 0 
+            END), 0) as venta_mes_anterior,
+            
+            -- Venta Año Actual
+            ISNULL(SUM(CASE 
+                WHEN YEAR(v.fecha) = @currentYear 
+                THEN v.subtotal ELSE 0 
+            END), 0) as venta_anio_actual,
+            
+            -- Venta Mes Actual
+            ISNULL(SUM(CASE 
+                WHEN YEAR(v.fecha) = @currentYear AND MONTH(v.fecha) = @currentMonth
+                THEN v.subtotal ELSE 0 
+            END), 0) as venta_mes_actual
+
+        FROM dbo.admClientes c
+        LEFT JOIN dbo.v_fact_ventas v ON v.id_cliente = c.CIDCLIENTEPROVEEDOR
+        WHERE c.CTIPOCLIENTE = 1 -- Solo clientes
+          -- Optimization: filter only relevant years
+          AND (v.fecha IS NULL OR YEAR(v.fecha) IN (@currentYear, @prevYear))
+        GROUP BY c.CIDCLIENTEPROVEEDOR, c.CRAZONSOCIAL
+        HAVING 
+            SUM(CASE WHEN YEAR(v.fecha) = @prevYear THEN v.subtotal ELSE 0 END) > 0 OR
+            SUM(CASE WHEN YEAR(v.fecha) = @currentYear THEN v.subtotal ELSE 0 END) > 0
+        ORDER BY venta_anio_actual DESC;
+    `;
 
     const result = await request.query(query);
     return result.recordset;
