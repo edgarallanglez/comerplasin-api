@@ -39,9 +39,16 @@ app.get("/ventas", async (req, reply) => {
     const request = conn.request();
 
     if (startDate && endDate) {
-        whereClauses.push("fecha >= @startDate AND fecha <= @endDate");
-        request.input("startDate", sql.Date, new Date(startDate));
-        request.input("endDate", sql.Date, new Date(endDate));
+        // Use exclusive upper bound (< next_day) to include the full end date
+        whereClauses.push("fecha >= @startDate AND fecha < @endDate");
+
+        const start = new Date(startDate);
+        const end = new Date(endDate);
+        end.setDate(end.getDate() + 2); // Add 2 days to cover full end date + timezone differences
+
+        request.input("startDate", sql.Date, start);
+        request.input("endDate", sql.Date, end);
+
         // If specific range requested, remove TOP limit to get full data
         query = "SELECT * FROM dbo.v_fact_ventas";
     } else if (year) {
@@ -51,13 +58,18 @@ app.get("/ventas", async (req, reply) => {
         if (month) {
             const m = parseInt(month) - 1; // JS months are 0-11
             start = new Date(y, m, 1);
-            end = new Date(y, m + 1, 0); // Last day of month
+            // First day of NEXT month
+            end = new Date(y, m + 1, 1);
+
+            whereClauses.push("fecha >= @yearStart AND fecha < @yearEnd");
         } else {
             start = new Date(y, 0, 1);
-            end = new Date(y, 11, 31);
+            // First day of NEXT year
+            end = new Date(y + 1, 0, 1);
+
+            whereClauses.push("fecha >= @yearStart AND fecha < @yearEnd");
         }
 
-        whereClauses.push("fecha >= @yearStart AND fecha <= @yearEnd");
         request.input("yearStart", sql.Date, start);
         request.input("yearEnd", sql.Date, end);
 
@@ -77,9 +89,87 @@ app.get("/ventas", async (req, reply) => {
 
     query += " ORDER BY fecha DESC, id_movimiento DESC;";
 
-    const result = await request.query(query);
+    // Execute main query
+    const mainResult = await request.query(query);
+    let combinedResults = mainResult.recordset;
 
-    return result.recordset;
+    // Fetch Remisiones (Concept 5) if filtering by date
+    let fetchRemisiones = false;
+    let remisionesQuery = `
+        SELECT 
+            m.CIDMOVIMIENTO as id_movimiento,
+            CAST(d.CIDDOCUMENTO as varchar) as id_documento,
+            d.CFECHA as fecha,
+            d.CIDCLIENTEPROVEEDOR as id_cliente,
+            c.CRAZONSOCIAL as cliente_name,
+            p.CNOMBREPRODUCTO as id_producto,
+            d.CIDCONCEPTODOCUMENTO as naturaleza_concepto,
+            d.CFECHAVENCIMIENTO as fecha_vencimiento,
+            d.CPENDIENTE as saldo_pendiente, 
+            m.CUNIDADES as cantidad,
+            m.CPRECIO as precio_unitario,
+            m.CNETO as subtotal,
+            m.CIMPUESTO1 as iva,
+            m.CTOTAL as total,
+            0 as costo_linea,
+            0 as costo_unitario,
+            'Remisión' as tipo -- Marker
+        FROM admMovimientos m
+        JOIN admDocumentos d ON m.CIDDOCUMENTO = d.CIDDOCUMENTO
+        JOIN admClientes c ON d.CIDCLIENTEPROVEEDOR = c.CIDCLIENTEPROVEEDOR
+        LEFT JOIN admProductos p ON m.CIDPRODUCTO = p.CIDPRODUCTO
+        WHERE d.CIDCONCEPTODOCUMENTO = 5
+          AND d.CCANCELADO = 0
+    `;
+
+    if (startDate && endDate) {
+        fetchRemisiones = true;
+        remisionesQuery += " AND d.CFECHA >= @startDate AND d.CFECHA < @endDate";
+    } else if (year) {
+        fetchRemisiones = true;
+        // Reuse the date logic from above or just relying on the params if they were set?
+        // Actually, if year/month passed, we constructed start/end dates?
+        // The code above handles 'year'/'month' by modifying 'query' string directly or checking logic.
+        // Wait, the original code for year/month uses SQL functions: YEAR(fecha) = @year
+        // So I should use the same logic for Remisiones.
+
+        if (month) {
+            remisionesQuery += " AND YEAR(d.CFECHA) = @year AND MONTH(d.CFECHA) = @month";
+        } else {
+            remisionesQuery += " AND YEAR(d.CFECHA) = @year";
+        }
+    }
+
+    if (fetchRemisiones) {
+        // Create a NEW request for the second query to avoid parameter conflicts/clearing issues
+        const remisionesRequest = conn.request();
+
+        // Re-add parameters
+        if (startDate && endDate) {
+            const start = new Date(startDate);
+            const end = new Date(endDate);
+            end.setDate(end.getDate() + 2);
+            remisionesRequest.input("startDate", sql.Date, start);
+            remisionesRequest.input("endDate", sql.Date, end);
+        } else if (year) {
+            remisionesRequest.input("year", sql.Int, parseInt(year));
+            if (month) {
+                remisionesRequest.input("month", sql.Int, parseInt(month));
+            }
+        }
+
+        try {
+            const remisionesResult = await remisionesRequest.query(remisionesQuery);
+            if (remisionesResult.recordset.length > 0) {
+                // console.log(`Found ${remisionesResult.recordset.length} Remisiones to append.`);
+                combinedResults = combinedResults.concat(remisionesResult.recordset);
+            }
+        } catch (err) {
+            console.error("Error fetching Remisiones:", err);
+        }
+    }
+
+    return combinedResults;
 });
 
 app.get("/clientes", async (req, reply) => {
@@ -599,7 +689,6 @@ app.get("/pagos-proveedores", async (req, reply) => {
     const request = conn.request();
     let whereClauses = [];
 
-    // Base filter: only data from 2023 onwards
     whereClauses.push("CFECHA >= '2023-01-01'");
 
     // Date filtering
@@ -699,10 +788,21 @@ app.get("/metas", async (req, reply) => {
     const currentMonth = month ? parseInt(month) : new Date().getMonth() + 1;
     const prevYear = currentYear - 1;
 
+    // Calculate consecutive previous month dynamically (wrapping to year - 1 if December)
+    let prevCurMonth = currentMonth - 1;
+    let prevCurYear = currentYear;
+    if (prevCurMonth === 0) {
+        prevCurMonth = 12;
+        prevCurYear = currentYear - 1;
+    }
+
     const request = conn.request();
     request.input("currentYear", sql.Int, currentYear);
     request.input("prevYear", sql.Int, prevYear);
     request.input("currentMonth", sql.Int, currentMonth);
+    // New parameters for consecutive previous month
+    request.input("prevCurYear", sql.Int, prevCurYear);
+    request.input("prevCurMonth", sql.Int, prevCurMonth);
 
     // Using subtotal as value metric
     const query = `
@@ -732,17 +832,24 @@ app.get("/metas", async (req, reply) => {
             ISNULL(SUM(CASE 
                 WHEN YEAR(v.fecha) = @currentYear AND MONTH(v.fecha) = @currentMonth
                 THEN v.subtotal ELSE 0 
-            END), 0) as venta_mes_actual
+            END), 0) as venta_mes_actual,
+
+            -- Venta Mes Consecutivo Anterior (Mes anterior al actual seleccionado)
+            ISNULL(SUM(CASE 
+                WHEN YEAR(v.fecha) = @prevCurYear AND MONTH(v.fecha) = @prevCurMonth
+                THEN v.subtotal ELSE 0 
+            END), 0) as venta_mes_anterior_actual
 
         FROM dbo.admClientes c
         LEFT JOIN dbo.v_fact_ventas v ON v.id_cliente = c.CIDCLIENTEPROVEEDOR
         WHERE c.CTIPOCLIENTE = 1 -- Solo clientes
           -- Optimization: filter only relevant years
-          AND (v.fecha IS NULL OR YEAR(v.fecha) IN (@currentYear, @prevYear))
+          AND (v.fecha IS NULL OR YEAR(v.fecha) IN (@currentYear, @prevYear, @prevCurYear))
         GROUP BY c.CIDCLIENTEPROVEEDOR, c.CRAZONSOCIAL
         HAVING 
             SUM(CASE WHEN YEAR(v.fecha) = @prevYear THEN v.subtotal ELSE 0 END) > 0 OR
-            SUM(CASE WHEN YEAR(v.fecha) = @currentYear THEN v.subtotal ELSE 0 END) > 0
+            SUM(CASE WHEN YEAR(v.fecha) = @currentYear THEN v.subtotal ELSE 0 END) > 0 OR
+            SUM(CASE WHEN YEAR(v.fecha) = @prevCurYear THEN v.subtotal ELSE 0 END) > 0
         ORDER BY venta_anio_actual DESC;
     `;
 
