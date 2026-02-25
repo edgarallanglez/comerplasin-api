@@ -196,22 +196,32 @@ app.get("/cobranza", async (req, reply) => {
     const conn = await (poolPromise ??= pool.connect());
     const { startDate, endDate, year, month, cliente } = req.query;
 
-    // Base query with GROUP BY to get distinct id_documento with saldo_pendiente
-    // Note: saldo_pendiente is the same for all line items in a document, so we use MAX (not SUM)
     let selectClause = `
         SELECT 
-            id_documento,
-            MIN(fecha) AS fecha,
-            MIN(fecha_vencimiento) AS fecha_vencimiento,
-            cliente_name,
-            MAX(saldo_pendiente) AS saldo_pendiente
-        FROM dbo.v_fact_ventas
+            d.CIDDOCUMENTO AS id_documento,
+            MIN(d.CFECHA) AS fecha,
+            MIN(d.CFECHAVENCIMIENTO) AS fecha_vencimiento,
+            c.CRAZONSOCIAL AS cliente_name,
+            -- CPENDIENTE is the remaining balance for the document.
+            -- We only want to include "Cargo" documents (debts) for Cobranza.
+            -- "Abono" documents (payments) would have CNATURALEZA = 1.
+            MAX(d.CPENDIENTE) AS saldo_pendiente
+        FROM dbo.admDocumentos d
+        JOIN dbo.admClientes c ON d.CIDCLIENTEPROVEEDOR = c.CIDCLIENTEPROVEEDOR
     `;
-    let whereClauses = ["saldo_pendiente > 0"];
+    let whereClauses = [
+        "d.CPENDIENTE > 0",
+        "d.CCANCELADO = 0",
+        "d.CUSACLIENTE = 1",
+        "d.CAFECTADO = 1",
+        "d.CNATURALEZA = 0",
+        "c.CESTATUS = 1",
+        "d.CIDCONCEPTODOCUMENTO IN (3012, 4, 3007, 3006, 5, 3, 14, 39)"
+    ];
     const request = conn.request();
 
     if (startDate && endDate) {
-        whereClauses.push("fecha >= @startDate AND fecha <= @endDate");
+        whereClauses.push("d.CFECHA >= @startDate AND d.CFECHA <= @endDate");
         request.input("startDate", sql.Date, new Date(startDate));
         request.input("endDate", sql.Date, new Date(endDate));
     } else if (year) {
@@ -227,20 +237,20 @@ app.get("/cobranza", async (req, reply) => {
             end = new Date(y, 11, 31);
         }
 
-        whereClauses.push("fecha >= @yearStart AND fecha <= @yearEnd");
+        whereClauses.push("d.CFECHA >= @yearStart AND d.CFECHA <= @yearEnd");
         request.input("yearStart", sql.Date, start);
         request.input("yearEnd", sql.Date, end);
     }
 
     if (cliente) {
-        whereClauses.push("id_cliente = @cliente");
+        whereClauses.push("d.CIDCLIENTEPROVEEDOR = @cliente");
         request.input("cliente", sql.Int, parseInt(cliente));
     }
 
     let query = selectClause + " WHERE " + whereClauses.join(" AND ");
-    query += " GROUP BY id_documento, cliente_name";
-    query += " HAVING MAX(saldo_pendiente) > 0";
-    query += " ORDER BY MIN(fecha_vencimiento) ASC, MAX(saldo_pendiente) DESC;";
+    query += " GROUP BY d.CIDDOCUMENTO, c.CRAZONSOCIAL";
+    query += " HAVING MAX(d.CPENDIENTE) > 0";
+    query += " ORDER BY MIN(d.CFECHAVENCIMIENTO) ASC, MAX(d.CPENDIENTE) DESC;";
 
     const result = await request.query(query);
 
@@ -809,6 +819,7 @@ app.get("/metas", async (req, reply) => {
         SELECT 
             c.CIDCLIENTEPROVEEDOR as id_cliente,
             c.CRAZONSOCIAL as cliente_name,
+            LTRIM(RTRIM(a.CNOMBREAGENTE)) as agente,
             
             -- Venta Año Anterior
             ISNULL(SUM(CASE 
@@ -841,11 +852,12 @@ app.get("/metas", async (req, reply) => {
             END), 0) as venta_mes_anterior_actual
 
         FROM dbo.admClientes c
+        LEFT JOIN dbo.admAgentes a ON c.CIDAGENTEVENTA = a.CIDAGENTE
         LEFT JOIN dbo.v_fact_ventas v ON v.id_cliente = c.CIDCLIENTEPROVEEDOR
         WHERE c.CTIPOCLIENTE = 1 -- Solo clientes
           -- Optimization: filter only relevant years
           AND (v.fecha IS NULL OR YEAR(v.fecha) IN (@currentYear, @prevYear, @prevCurYear))
-        GROUP BY c.CIDCLIENTEPROVEEDOR, c.CRAZONSOCIAL
+        GROUP BY c.CIDCLIENTEPROVEEDOR, c.CRAZONSOCIAL, a.CNOMBREAGENTE
         HAVING 
             SUM(CASE WHEN YEAR(v.fecha) = @prevYear THEN v.subtotal ELSE 0 END) > 0 OR
             SUM(CASE WHEN YEAR(v.fecha) = @currentYear THEN v.subtotal ELSE 0 END) > 0 OR
