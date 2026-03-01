@@ -44,7 +44,7 @@ app.get("/ventas", async (req, reply) => {
 
         const start = new Date(startDate);
         const end = new Date(endDate);
-        end.setDate(end.getDate() + 2); // Add 2 days to cover full end date + timezone differences
+        end.setUTCDate(end.getUTCDate() + 1); // Add exactly 1 day for exclusive upper bound (<)
 
         request.input("startDate", sql.Date, start);
         request.input("endDate", sql.Date, end);
@@ -148,7 +148,7 @@ app.get("/ventas", async (req, reply) => {
         if (startDate && endDate) {
             const start = new Date(startDate);
             const end = new Date(endDate);
-            end.setDate(end.getDate() + 2);
+            end.setUTCDate(end.getUTCDate() + 1);
             remisionesRequest.input("startDate", sql.Date, start);
             remisionesRequest.input("endDate", sql.Date, end);
         } else if (year) {
